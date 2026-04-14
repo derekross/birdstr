@@ -123,14 +123,22 @@ class NostrService {
   }
 
   /// Query events from connected relays.
+  ///
+  /// If [tempRelays] is provided, also temporarily connects to those
+  /// relays for this query (NIP-65 outbox model).
   Future<List<Event>> queryEvents(
     List<Map<String, dynamic>> filters, {
+    List<String>? tempRelays,
     Duration timeout = const Duration(seconds: 10),
   }) async {
     if (_nostr == null) {
       throw StateError('Not logged in.');
     }
-    return _nostr!.queryEvents(filters, timeout: timeout);
+    return _nostr!.queryEvents(
+      filters,
+      tempRelays: tempRelays,
+      timeout: timeout,
+    );
   }
 
   /// Disconnect and clear credentials.

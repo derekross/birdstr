@@ -32,6 +32,10 @@ class RelayService {
   List<RelayEntry> _relays = List.of(defaultRelayEntries);
   bool _loadedFromNostr = false;
 
+  /// Cache of other users' write relays (pubkey → relay URLs).
+  /// Avoids re-fetching for the same user during a session.
+  final Map<String, List<String>> _userWriteRelayCache = {};
+
   /// The current relay list.
   List<RelayEntry> get relays => List.unmodifiable(_relays);
 
@@ -104,6 +108,59 @@ class RelayService {
       debugPrint('[RelayService] fetch error: $e');
     }
   }
+
+  /// Fetch another user's write relays from their NIP-65 event.
+  ///
+  /// Results are cached for the session. Returns the user's write
+  /// relay URLs, or an empty list if no NIP-65 event is found.
+  /// Falls back to querying from our own connected relays.
+  Future<List<String>> fetchUserWriteRelays(String pubkey, Nostr nostr) async {
+    // Check cache first.
+    if (_userWriteRelayCache.containsKey(pubkey)) {
+      return _userWriteRelayCache[pubkey]!;
+    }
+
+    try {
+      final events = await nostr.queryEvents([
+        {
+          'kinds': [EventKind.relayListMetadata],
+          'authors': [pubkey],
+          'limit': 1,
+        },
+      ], timeout: const Duration(seconds: 5));
+
+      if (events.isEmpty) {
+        _userWriteRelayCache[pubkey] = [];
+        return [];
+      }
+
+      final event = events.first;
+      final writeUrls = <String>[];
+
+      for (final tag in event.tags) {
+        if (tag.isEmpty || tag[0] != 'r' || tag.length < 2) continue;
+        final url = tag[1];
+        if (tag.length >= 3) {
+          // Only 'write' markers indicate write relays.
+          if (tag[2] == 'write') writeUrls.add(url);
+        } else {
+          // No marker = both read and write.
+          writeUrls.add(url);
+        }
+      }
+
+      _userWriteRelayCache[pubkey] = writeUrls;
+      debugPrint('[RelayService] user $pubkey write relays: $writeUrls');
+      return writeUrls;
+    } catch (e) {
+      debugPrint('[RelayService] fetchUserWriteRelays error: $e');
+      _userWriteRelayCache[pubkey] = [];
+      return [];
+    }
+  }
+
+  /// Clear the user relay cache (call on logout or when stale).
+  void clearUserRelayCache() => _userWriteRelayCache.clear();
 
   /// Publish the current relay list to Nostr as a kind:10002 event.
   Future<Event?> saveRelayList(Nostr nostr, String pubkey) async {

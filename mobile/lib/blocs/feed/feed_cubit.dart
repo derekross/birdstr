@@ -1,10 +1,12 @@
 import 'package:equatable/equatable.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:nostr_sdk/nostr_sdk.dart';
 
 import '../../models/observation.dart';
 import '../../services/location_service.dart';
 import '../../services/nostr_service.dart';
+import '../../services/relay_service.dart';
 import '../../services/social_service.dart';
 
 part 'feed_state.dart';
@@ -142,7 +144,15 @@ class FeedCubit extends Cubit<FeedState> {
     }
   }
 
-  /// Load observations from birders the user follows.
+  /// Load observations from birders the user follows (NIP-65 outbox model).
+  ///
+  /// For each followed user:
+  /// 1. Look up their write relays from their NIP-65 event (kind:10002)
+  /// 2. Query those specific relays for their kind:30747 bird observations
+  /// 3. Fall back to our own relays if no NIP-65 event is found
+  ///
+  /// This is the correct decentralized approach — we go to where
+  /// each user publishes, not just where we happen to be connected.
   Future<void> loadFollowingFeed() async {
     if (!_nostrService.isAuthenticated) {
       emit(const FeedState(status: FeedStatus.error, error: 'Not logged in.'));
@@ -152,6 +162,9 @@ class FeedCubit extends Cubit<FeedState> {
     emit(const FeedState(status: FeedStatus.loading));
 
     try {
+      final nostr = _nostrService.nostr;
+      if (nostr == null) throw StateError('No Nostr instance');
+
       // Get who we follow.
       final following = await SocialService.instance.getFollowing();
 
@@ -160,24 +173,113 @@ class FeedCubit extends Cubit<FeedState> {
         return;
       }
 
-      final events = await _nostrService.queryEvents([
-        {
-          'kinds': [30747],
-          'authors': following.toList(),
-          'limit': 100,
-        },
-      ]);
+      debugPrint(
+        '[FeedCubit] loading following feed for '
+        '${following.length} users (NIP-65 outbox)',
+      );
+
+      final allEvents = <Event>[];
+
+      // Group users by their write relays to batch queries.
+      // Users sharing the same write relays get queried together.
+      final relayToAuthors = <String, Set<String>>{};
+      final usersWithoutRelays = <String>{};
+
+      for (final pubkey in following) {
+        final writeRelays = await RelayService.instance.fetchUserWriteRelays(
+          pubkey,
+          nostr,
+        );
+
+        if (writeRelays.isEmpty) {
+          usersWithoutRelays.add(pubkey);
+        } else {
+          for (final relay in writeRelays) {
+            relayToAuthors.putIfAbsent(relay, () => {}).add(pubkey);
+          }
+        }
+      }
+
+      // Query each relay group in parallel.
+      final futures = <Future<List<Event>>>[];
+
+      for (final entry in relayToAuthors.entries) {
+        final relay = entry.key;
+        final authors = entry.value.toList();
+
+        debugPrint('[FeedCubit] querying $relay for ${authors.length} authors');
+
+        futures.add(
+          _nostrService
+              .queryEvents(
+                [
+                  {
+                    'kinds': [30747],
+                    'authors': authors,
+                    'limit': 50,
+                  },
+                ],
+                tempRelays: [relay],
+                timeout: const Duration(seconds: 8),
+              )
+              .catchError((e) {
+                debugPrint('[FeedCubit] query to $relay failed: $e');
+                return <Event>[];
+              }),
+        );
+      }
+
+      // For users without NIP-65, fall back to our connected relays.
+      if (usersWithoutRelays.isNotEmpty) {
+        debugPrint(
+          '[FeedCubit] ${usersWithoutRelays.length} users '
+          'without NIP-65, querying own relays',
+        );
+
+        futures.add(
+          _nostrService
+              .queryEvents([
+                {
+                  'kinds': [30747],
+                  'authors': usersWithoutRelays.toList(),
+                  'limit': 50,
+                },
+              ])
+              .catchError((e) {
+                debugPrint('[FeedCubit] fallback query failed: $e');
+                return <Event>[];
+              }),
+        );
+      }
+
+      // Wait for all queries to complete.
+      final results = await Future.wait(futures);
+      for (final events in results) {
+        allEvents.addAll(events);
+      }
+
+      // Deduplicate by event ID (same event may appear on multiple relays).
+      final seen = <String>{};
+      final unique = <Event>[];
+      for (final event in allEvents) {
+        if (seen.add(event.id)) {
+          unique.add(event);
+        }
+      }
 
       final observations =
-          events.map(Observation.fromEvent).whereType<Observation>().toList()
+          unique.map(Observation.fromEvent).whereType<Observation>().toList()
             ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
       emit(FeedState(status: FeedStatus.loaded, observations: observations));
 
       debugPrint(
-        '[FeedCubit] following feed: ${observations.length} observations',
+        '[FeedCubit] following feed: ${observations.length} observations '
+        'from ${relayToAuthors.length} relay groups + '
+        '${usersWithoutRelays.length} fallback users',
       );
     } catch (e) {
+      debugPrint('[FeedCubit] following feed error: $e');
       emit(
         FeedState(
           status: FeedStatus.error,
