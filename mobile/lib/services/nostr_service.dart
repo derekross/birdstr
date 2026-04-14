@@ -1,9 +1,12 @@
 import 'package:flutter/foundation.dart';
 import 'package:nostr_sdk/nostr_sdk.dart';
 
+import 'blossom_server_service.dart';
+import 'relay_service.dart';
+
 /// Manages the Nostr connection — signer, relay pool, event publishing.
 ///
-/// This is the app's single point of contact with the Nostr network.
+/// Relay URLs come from [RelayService] (NIP-65) instead of being hardcoded.
 class NostrService {
   NostrService._();
   static final instance = NostrService._();
@@ -11,13 +14,6 @@ class NostrService {
   Nostr? _nostr;
   NostrSigner? _signer;
   String? _publicKey;
-
-  /// Default relays for publishing bird observations.
-  static const defaultRelays = [
-    'wss://relay.damus.io',
-    'wss://nos.lol',
-    'wss://relay.ditto.pub',
-  ];
 
   /// Whether we have an active signer.
   bool get isAuthenticated => _signer != null && _publicKey != null;
@@ -65,18 +61,29 @@ class NostrService {
     _publicKey = _nostr!.publicKey;
     debugPrint('[NostrService] logged in as $_publicKey');
 
-    // Connect to default relays.
-    for (final url in defaultRelays) {
-      try {
-        await _nostr!.addRelay(
-          RelayBase(url, RelayStatus(url)),
-          autoSubscribe: false,
-          init: true,
-        );
-        debugPrint('[NostrService] connected to $url');
-      } catch (e) {
-        debugPrint('[NostrService] failed to connect to $url: $e');
-      }
+    // Load cached relay list for fast startup, then connect.
+    final relayService = RelayService.instance;
+    await relayService.loadFromLocal();
+    await relayService.connectAll(_nostr!);
+
+    // Also load cached blossom servers.
+    await BlossomServerService.instance.loadFromLocal();
+  }
+
+  /// Fetch the user's relay and blossom lists from Nostr.
+  /// Call this after login + initial relay connection.
+  Future<void> fetchUserLists() async {
+    final pk = publicKey;
+    final nostr = _nostr;
+    if (pk == null || nostr == null) return;
+
+    await RelayService.instance.fetchRelayList(pk, nostr);
+    await BlossomServerService.instance.fetchServerList(pk, nostr);
+
+    // Reconnect with updated relay list if it changed.
+    if (RelayService.instance.loadedFromNostr) {
+      debugPrint('[NostrService] reconnecting with updated relay list');
+      await RelayService.instance.connectAll(nostr);
     }
   }
 
@@ -103,9 +110,6 @@ class NostrService {
   }
 
   /// Request deletion of an event (NIP-09, kind:5).
-  ///
-  /// Publishes a kind:5 event referencing the target event.
-  /// Relays SHOULD delete the referenced event, but compliance varies.
   Future<Event?> deleteEvent(String eventId) async {
     final pk = publicKey;
     if (pk == null || _nostr == null) {

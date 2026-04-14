@@ -10,6 +10,7 @@ import '../../blocs/publish/publish_cubit.dart';
 import '../../models/detection_with_audio.dart';
 import '../../services/audio_encoder_service.dart';
 import '../../services/blossom_auth_provider_impl.dart';
+import '../../services/blossom_server_service.dart';
 import '../../services/location_service.dart';
 import '../../widgets/audio_trimmer/audio_trimmer.dart';
 
@@ -66,39 +67,44 @@ class _PublishScreenState extends State<PublishScreen> {
 
     if (!mounted) return;
 
-    // Upload to Blossom (if encoding succeeded).
+    // Upload to Blossom servers (try each until one succeeds).
     String? audioUrl;
     String? audioHash;
     if (wavPath != null) {
-      try {
-        final uploader = BlossomUploadService(
-          authProvider: BlossomAuthProviderImpl(),
-          defaultServerUrl: 'https://blossom.band',
-        );
-        final file = File(wavPath);
-        final hashResult = await HashUtil.sha256File(file);
-        audioHash = hashResult.hash;
-        debugPrint(
-          '[PublishScreen] uploading audio: hash=$audioHash '
-          'size=${hashResult.size} bytes',
-        );
-        final result = await uploader.uploadAudio(
-          audioFile: file,
-          mimeType: 'audio/wav',
-        );
-        debugPrint(
-          '[PublishScreen] upload result: success=${result.success} '
-          'url=${result.url} cdnUrl=${result.cdnUrl} '
-          'error=${result.errorMessage}',
-        );
-        if (result.success && result.cdnUrl != null) {
-          audioUrl = result.cdnUrl;
+      final file = File(wavPath);
+      final hashResult = await HashUtil.sha256File(file);
+      audioHash = hashResult.hash;
+      debugPrint(
+        '[PublishScreen] uploading audio: hash=$audioHash '
+        'size=${hashResult.size} bytes',
+      );
+
+      final servers = BlossomServerService.instance.servers;
+      for (final server in servers) {
+        try {
+          final uploader = BlossomUploadService(
+            authProvider: BlossomAuthProviderImpl(),
+            defaultServerUrl: server,
+          );
+          final result = await uploader.uploadAudio(
+            audioFile: file,
+            mimeType: 'audio/wav',
+          );
+          debugPrint(
+            '[PublishScreen] upload to $server: success=${result.success} '
+            'url=${result.url} cdnUrl=${result.cdnUrl}',
+          );
+          if (result.success && result.cdnUrl != null) {
+            audioUrl = result.cdnUrl;
+            break;
+          }
+        } catch (e) {
+          debugPrint('[PublishScreen] upload to $server failed: $e');
+          // Try next server.
         }
-        await encoder.cleanup(wavPath);
-      } catch (e) {
-        debugPrint('[PublishScreen] Blossom upload failed: $e');
-        // Continue without audio — still publish the observation.
       }
+
+      await encoder.cleanup(wavPath);
     }
 
     if (!mounted) return;

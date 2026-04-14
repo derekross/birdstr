@@ -46,6 +46,9 @@ class AuthCubit extends Cubit<AuthState> {
           npub: _nostrService.npub,
         ),
       );
+
+      // Fetch user's relay and blossom server lists from Nostr.
+      _nostrService.fetchUserLists();
     } catch (e) {
       emit(
         AuthState(
@@ -88,6 +91,9 @@ class AuthCubit extends Cubit<AuthState> {
       );
 
       debugPrint('[AuthCubit] connected via NIP-46 bunker');
+
+      // Fetch user's relay and blossom server lists from Nostr.
+      _nostrService.fetchUserLists();
     } catch (e) {
       debugPrint('[AuthCubit] bunker connection failed: $e');
       emit(
