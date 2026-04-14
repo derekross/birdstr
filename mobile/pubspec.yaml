@@ -1,0 +1,85 @@
+name: birds
+description: Identify bird sounds on-device with BirdNET and publish observations to Nostr.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.0
+  flutter: ^3.41.1
+
+workspace:
+  - packages/birdnet_flutter
+  - packages/nostr_sdk
+  - packages/nostr_client
+  - packages/nostr_key_manager
+  - packages/blossom_upload_service
+  - packages/db_client
+  - packages/unified_logger
+  - packages/image_metadata_stripper
+  - packages/models
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Local packages — BirdNET inference
+  birdnet_flutter:
+    path: packages/birdnet_flutter
+
+  # Local packages — Nostr (from Divine)
+  nostr_sdk:
+    path: packages/nostr_sdk
+  nostr_client:
+    path: packages/nostr_client
+  nostr_key_manager:
+    path: packages/nostr_key_manager
+  blossom_upload_service:
+    path: packages/blossom_upload_service
+
+  # State management
+  flutter_bloc: ^9.0.0
+  equatable: ^2.0.7
+
+  # Navigation
+  go_router: ^16.2.4
+
+  # Location
+  geolocator: ^13.0.2
+  permission_handler: ^11.3.1
+
+  # Storage
+  shared_preferences: ^2.5.3
+  flutter_secure_storage: ^9.0.0
+
+  # Geohash
+  dart_geohash: ^2.0.4
+
+  # Audio
+  just_audio: ^0.9.43
+
+  # Map
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+  # UI
+  google_fonts: ^6.3.2
+  cached_network_image: ^3.3.1
+
+  # Utilities
+  intl: any
+  http: ^1.6.0
+  path_provider: ^2.1.5
+  uuid: ^4.5.3
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  build_runner: ^2.10.4
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/models/

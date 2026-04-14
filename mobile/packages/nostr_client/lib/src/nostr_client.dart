@@ -1,0 +1,1068 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+import 'package:db_client/db_client.dart' hide Filter;
+import 'package:meta/meta.dart';
+import 'package:nostr_client/src/models/models.dart';
+import 'package:nostr_client/src/relay_manager.dart';
+import 'package:nostr_sdk/nostr_sdk.dart';
+import 'package:nostr_sdk/utils/hash_util.dart';
+
+/// Observer for NostrClient activity statistics.
+///
+/// Implement this interface and set it via [NostrClient.statisticsObserver]
+/// to receive callbacks for subscription and event activity.
+abstract class NostrClientStatisticsObserver {
+  /// Called when a new subscription is created
+  void onSubscriptionStarted(String subscriptionId);
+
+  /// Called when a subscription is closed
+  void onSubscriptionClosed(String subscriptionId);
+
+  /// Called when an event is received from a relay
+  void onEventReceived();
+
+  /// Called when an event is sent to relays
+  void onEventSent();
+}
+
+/// {@template nostr_client}
+/// Abstraction layer for Nostr communication
+///
+/// This client wraps nostr_sdk and provides:
+/// - Subscription deduplication (prevents duplicate subscriptions)
+/// - Local database caching for faster queries
+/// - Clean API for repositories to use
+/// - Proper resource management
+/// - Relay management via RelayManager
+/// {@endtemplate}
+class NostrClient {
+  /// {@macro nostr_client}
+  ///
+  /// Creates a new NostrClient instance with the given configuration.
+  /// The RelayManager is created internally using the Nostr instance's
+  /// RelayPool to ensure they share the same connection pool.
+  ///
+  /// Optional [dbClient] enables local caching of events for faster
+  /// queries and auto-caching of subscription events.
+  factory NostrClient({
+    required NostrClientConfig config,
+    required RelayManagerConfig relayManagerConfig,
+    AppDbClient? dbClient,
+  }) {
+    final nostr = _createNostr(config);
+    final relayManager = RelayManager(
+      config: relayManagerConfig,
+      relayPool: nostr.relayPool,
+    );
+    return NostrClient._internal(
+      nostr: nostr,
+      relayManager: relayManager,
+      dbClient: dbClient,
+    );
+  }
+
+  /// Internal constructor used by factory and testing constructors
+  NostrClient._internal({
+    required Nostr nostr,
+    required RelayManager relayManager,
+    AppDbClient? dbClient,
+  }) : _nostr = nostr,
+       _relayManager = relayManager,
+       _dbClient = dbClient;
+
+  /// Creates a NostrClient with injected dependencies for testing
+  @visibleForTesting
+  NostrClient.forTesting({
+    required Nostr nostr,
+    required RelayManager relayManager,
+    AppDbClient? dbClient,
+  }) : _nostr = nostr,
+       _relayManager = relayManager,
+       _dbClient = dbClient;
+
+  static Nostr _createNostr(NostrClientConfig config) {
+    RelayBase tempRelayGenerator(String url) => RelayBase(
+      url,
+      RelayStatus(url),
+      channelFactory: config.webSocketChannelFactory,
+    );
+    return Nostr(
+      config.signer,
+      config.eventFilters,
+      tempRelayGenerator,
+      onNotice: config.onNotice,
+      channelFactory: config.webSocketChannelFactory,
+    );
+  }
+
+  final Nostr _nostr;
+  final RelayManager _relayManager;
+  final AppDbClient? _dbClient;
+
+  /// The signer used by this client for event signing and NIP-44 encryption.
+  ///
+  /// Exposes the same `NostrSigner` instance that the client was created with.
+  /// Other components that need NIP-44 operations (e.g. DM decryption) should
+  /// reuse this signer rather than creating their own, to ensure consistent
+  /// key material.
+  NostrSigner get signer => _nostr.nostrSigner;
+
+  /// Convenience getter for the NostrEventsDao
+  NostrEventsDao? get _nostrEventsDao => _dbClient?.database.nostrEventsDao;
+
+  /// Helper to cache an event with default expiry.
+  ///
+  /// Fire-and-forget pattern - errors are silently ignored since caching
+  /// failures should not affect the send operation's success.
+  void _cacheEvent(Event event) {
+    try {
+      unawaited(_nostrEventsDao?.upsertEvent(event));
+    } on Object {
+      // Ignore cache errors
+    }
+  }
+
+  /// Checks if an event kind supports safe optimistic caching.
+  ///
+  /// Returns `false` for:
+  /// - Deletion events (Kind 5): They remove data, not add
+  /// - Replaceable events (Kind 0, 3, 10000-19999): Upsert deletes old event
+  /// - Parameterized replaceable (Kind 30000-39999): Same issue
+  ///
+  /// For these kinds, caching on success is safer to avoid data loss on
+  /// rollback.
+  bool _canOptimisticallyCache(int kind) {
+    if (kind == EventKind.eventDeletion) return false;
+    if (EventKind.isReplaceable(kind)) return false;
+    if (EventKind.isParameterizedReplaceable(kind)) return false;
+    return true;
+  }
+
+  /// Removes an optimistically cached event on send failure.
+  ///
+  /// Fire-and-forget pattern - errors are silently ignored since rollback
+  /// failures should not affect the operation's result.
+  void _rollbackCachedEvent(String eventId) {
+    try {
+      unawaited(_nostrEventsDao?.deleteEventsByIds([eventId]));
+    } on Object {
+      // Ignore rollback errors
+    }
+  }
+
+  /// Handles a NIP-09 deletion event (Kind 5) by removing target events
+  /// from the local database.
+  ///
+  /// Extracts event IDs from 'e' tags and deletes them from both the events
+  /// table and video_metrics table.
+  ///
+  /// Fire-and-forget pattern - errors are silently ignored.
+  void _handleDeletionEvent(Event deletionEvent) {
+    if (deletionEvent.kind != EventKind.eventDeletion) return;
+
+    // Extract target event IDs from 'e' tags
+    final targetEventIds = <String>[];
+    for (final dynamic tag in deletionEvent.tags) {
+      if (tag is List && tag.isNotEmpty && tag[0] == 'e' && tag.length > 1) {
+        final eventId = tag[1];
+        if (eventId is String) {
+          targetEventIds.add(eventId);
+        }
+      }
+    }
+
+    if (targetEventIds.isEmpty) return;
+
+    // Delete target events from the database (fire-and-forget)
+    try {
+      unawaited(_nostrEventsDao?.deleteEventsByIds(targetEventIds));
+    } on Object {
+      // Ignore deletion errors
+    }
+  }
+
+  /// Tracks whether dispose() has been called
+  bool _isDisposed = false;
+
+  /// Public key of the client
+  String get publicKey => _nostr.publicKey;
+
+  /// Whether the client has been initialized
+  ///
+  /// Returns true if the relay manager is initialized
+  bool get isInitialized => _relayManager.isInitialized;
+
+  /// Whether the client has been disposed
+  ///
+  /// After disposal, the client should not be used
+  bool get isDisposed => _isDisposed;
+
+  /// Whether the client has keys configured
+  ///
+  /// Returns true if the public key is not empty
+  bool get hasKeys => publicKey.isNotEmpty;
+
+  /// Initializes the client by connecting to configured relays
+  ///
+  /// This must be called before using the client to ensure relay connections
+  /// are established. Also refreshes the public key from the signer to ensure
+  /// the client has the correct key. Can be called multiple times safely.
+  Future<void> initialize() async {
+    // Refresh public key from signer - signer is the single source of truth
+    await _nostr.refreshPublicKey();
+    await _relayManager.initialize();
+  }
+
+  /// Optional observer for tracking statistics (subscriptions, events)
+  NostrClientStatisticsObserver? statisticsObserver;
+
+  /// Number of active subscriptions
+  int get activeSubscriptionCount => _subscriptionStreams.length;
+
+  /// Map of subscription IDs to their filter hashes (for deduplication)
+  final Map<String, String> _subscriptionFilters = {};
+
+  /// Map of active subscriptions
+  final Map<String, StreamController<Event>> _subscriptionStreams = {};
+
+  /// Publishes an event to relays
+  ///
+  /// Delegates to nostr_sdk for relay management and broadcasting.
+  ///
+  /// **Caching strategy:**
+  /// - Regular events: Optimistic cache before send, rollback on failure
+  /// - Replaceable events (0, 3, 10000-39999): Cache on success only
+  ///   (upsert deletes old record, so rollback would lose data)
+  /// - Deletion events (Kind 5): Removes target events from cache on success
+  ///
+  /// Returns the sent event if successful, or `null` if failed.
+  Future<Event?> publishEvent(
+    Event event, {
+    List<String>? targetRelays,
+  }) async {
+    final useOptimisticCache = _canOptimisticallyCache(event.kind);
+
+    // Optimistic cache for regular events only
+    if (useOptimisticCache) {
+      _cacheEvent(event);
+    }
+
+    // Checks health of relays, attempts reconnection if none connected,
+    // and exits if reconnect is unsuccessful
+    if (_relayManager.connectedRelays.isEmpty) {
+      await retryDisconnectedRelays();
+      if (_relayManager.connectedRelays.isEmpty) {
+        // Rollback optimistic cache on failure
+        if (useOptimisticCache) {
+          _rollbackCachedEvent(event.id);
+        }
+        return null;
+      }
+    }
+
+    final sentEvent = await _nostr.sendEvent(
+      event,
+      targetRelays: targetRelays,
+      // Also pass as tempRelays so the SDK creates temporary connections
+      // to target relays not already in the connected pool. Without this,
+      // targetRelays only filters the existing pool and the event could
+      // be sent to zero relays.
+      tempRelays: targetRelays,
+    );
+
+    if (sentEvent == null) {
+      // Rollback optimistic cache on failure
+      if (useOptimisticCache) {
+        _rollbackCachedEvent(event.id);
+      }
+      return null;
+    }
+
+    // Handle successful send
+    if (sentEvent.kind == EventKind.eventDeletion) {
+      // NIP-09: Remove target events from cache
+      _handleDeletionEvent(sentEvent);
+    } else if (!useOptimisticCache) {
+      // Cache replaceable events on success (not optimistically)
+      _cacheEvent(sentEvent);
+    }
+
+    statisticsObserver?.onEventSent();
+
+    return sentEvent;
+  }
+
+  /// Queries events with given filters
+  ///
+  /// Query flow: **Cache + WebSocket**
+  ///
+  /// If [useCache] is `true` and cache is available, checks local cache first.
+  /// Then queries via WebSocket and merges results.
+  ///
+  /// Results from websocket are cached for future queries.
+  Future<List<Event>> queryEvents(
+    List<Filter> filters, {
+    String? subscriptionId,
+    List<String>? tempRelays,
+    List<int> relayTypes = RelayType.all,
+    bool sendAfterAuth = false,
+    bool useCache = true,
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final cacheResults = <Event>[];
+
+    // 1. Get cache results (don't return early - we'll merge with network)
+    final dao = _nostrEventsDao;
+    if (useCache && dao != null && filters.length == 1) {
+      cacheResults.addAll(await dao.getEventsByFilter(filters.first));
+    }
+
+    // 2. Query via WebSocket
+    final filtersJson = filters.map((f) => f.toJson()).toList();
+    final websocketEvents = await _nostr.queryEvents(
+      filtersJson,
+      id: subscriptionId,
+      tempRelays: tempRelays,
+      relayTypes: relayTypes,
+      sendAfterAuth: sendAfterAuth,
+      timeout: timeout,
+    );
+
+    // Cache websocket results (fire-and-forget)
+    if (websocketEvents.isNotEmpty) {
+      try {
+        unawaited(_nostrEventsDao?.upsertEventsBatch(websocketEvents));
+      } on Object {
+        // Ignore cache errors
+      }
+    }
+
+    // Merge cache + websocket and return (respecting original limit)
+    // Only apply limit when using a single filter - with multiple filters,
+    // each filter has its own limit and we shouldn't restrict the combined
+    // result set (e.g., getVideosByAddressableIds sends N filters with limit=1
+    // each, expecting N results total).
+    final limit = filters.length == 1 ? filters.first.limit : null;
+    return _mergeEvents(cacheResults, websocketEvents, limit: limit);
+  }
+
+  /// Counts events matching the given filters using NIP-45.
+  ///
+  /// This is more efficient than [queryEvents] when you only need the count,
+  /// not the actual events. Uses NIP-45 COUNT requests to relays.
+  ///
+  /// Falls back to client-side counting if relay doesn't support NIP-45.
+  ///
+  /// Example - Count followers:
+  /// ```dart
+  /// final result = await client.countEvents([
+  ///   Filter(kinds: [3], p: [pubkey]),
+  /// ]);
+  /// print('Follower count: ${result.count}');
+  /// ```
+  ///
+  /// Example - Count reactions on an event:
+  /// ```dart
+  /// final result = await client.countEvents([
+  ///   Filter(kinds: [7], e: [eventId]),
+  /// ]);
+  /// print('Reaction count: ${result.count}');
+  /// ```
+  Future<CountResult> countEvents(
+    List<Filter> filters, {
+    String? subscriptionId,
+    List<String>? tempRelays,
+    List<int> relayTypes = RelayType.all,
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final filtersJson = filters.map((f) => f.toJson()).toList();
+
+    try {
+      // Try NIP-45 COUNT first
+      final response = await _nostr.countEvents(
+        filtersJson,
+        id: subscriptionId,
+        tempRelays: tempRelays,
+        relayTypes: relayTypes,
+        timeout: timeout,
+      );
+
+      return CountResult(
+        count: response.count,
+        approximate: response.approximate,
+      );
+    } on CountNotSupportedException {
+      // Fall back to fetching events and counting client-side
+      final events = await queryEvents(
+        filters,
+        tempRelays: tempRelays,
+        relayTypes: relayTypes,
+      );
+
+      return CountResult(
+        count: events.length,
+        source: CountSource.clientSide,
+      );
+    }
+  }
+
+  /// Fetches a single event by ID
+  ///
+  /// Query flow: **Cache → WebSocket**
+  ///
+  /// If [useCache] is `true` and cache is available, checks local cache first.
+  /// Falls back to WebSocket query if cache miss.
+  ///
+  /// Results from websocket are cached for future queries.
+  Future<Event?> fetchEventById(
+    String eventId, {
+    String? relayUrl,
+    bool useCache = true,
+  }) async {
+    // 1. Check cache first
+    final dao = _nostrEventsDao;
+    if (useCache && dao != null) {
+      final cached = await dao.getEventById(eventId);
+      if (cached != null) {
+        return cached;
+      }
+    }
+
+    // 2. Query via WebSocket
+    final targetRelays = relayUrl != null ? [relayUrl] : null;
+    final filters = [
+      Filter(ids: [eventId], limit: 1),
+    ];
+    final events = await queryEvents(
+      filters,
+      useCache: false, // Already checked cache above
+      tempRelays: targetRelays,
+    );
+    if (events.isNotEmpty) {
+      // Cache websocket result (fire-and-forget)
+      try {
+        unawaited(_nostrEventsDao?.upsertEvent(events.first));
+      } on Object {
+        // Ignore cache errors
+      }
+
+      return events.first;
+    }
+    return null;
+  }
+
+  /// Fetches a profile (kind 0) by pubkey
+  ///
+  /// Query flow: **Cache → WebSocket**
+  ///
+  /// If [useCache] is `true` and cache is available, checks local cache first.
+  /// Falls back to WebSocket query if cache miss.
+  ///
+  /// Results from websocket are cached for future queries.
+  Future<Event?> fetchProfile(
+    String pubkey, {
+    bool useCache = true,
+  }) async {
+    // 1. Check cache first
+    final dao = _nostrEventsDao;
+    if (useCache && dao != null) {
+      final cached = await dao.getProfileByPubkey(pubkey);
+      if (cached != null) {
+        return cached;
+      }
+    }
+
+    // 2. Query via WebSocket
+    final filters = [
+      Filter(authors: [pubkey], kinds: [EventKind.metadata], limit: 1),
+    ];
+    final events = await queryEvents(
+      filters,
+      useCache: false, // Already checked cache above
+    );
+    if (events.isNotEmpty) {
+      // Cache websocket result (fire-and-forget)
+      try {
+        unawaited(_nostrEventsDao?.upsertEvent(events.first));
+      } on Object {
+        // Ignore cache errors
+      }
+      return events.first;
+    }
+    return null;
+  }
+
+  /// Subscribes to events matching the given filters
+  ///
+  /// Returns a stream of events. Automatically deduplicates subscriptions
+  /// with identical filters to prevent duplicate WebSocket subscriptions.
+  Stream<Event> subscribe(
+    List<Filter> filters, {
+    String? subscriptionId,
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+    List<int> relayTypes = RelayType.all,
+    bool sendAfterAuth = false,
+    void Function()? onEose,
+  }) {
+    // Generate deterministic subscription ID based on filter content
+    final filterHash = _generateFilterHash(filters);
+    final id = subscriptionId ?? 'sub_$filterHash';
+
+    // Check if we already have this exact subscription
+    if (_subscriptionStreams.containsKey(id) &&
+        !_subscriptionStreams[id]!.isClosed) {
+      return _subscriptionStreams[id]!.stream;
+    }
+
+    // Ensure relays are connected before subscribing
+    if (_relayManager.connectedRelays.isEmpty) {
+      unawaited(retryDisconnectedRelays());
+    }
+
+    // Create new stream controller
+    final controller = StreamController<Event>.broadcast();
+    _subscriptionStreams[id] = controller;
+    _subscriptionFilters[id] = filterHash;
+
+    // Convert filters to JSON format expected by nostr_sdk
+    final filtersJson = filters.map((f) => f.toJson()).toList();
+
+    // Subscribe using nostr_sdk
+    final actualId = _nostr.subscribe(
+      filtersJson,
+      (event) {
+        // Handle NIP-09 deletion events by removing target events from DB
+        if (event.kind == EventKind.eventDeletion) {
+          _handleDeletionEvent(event);
+        } else {
+          // Auto-cache non-deletion events (fire-and-forget)
+          try {
+            unawaited(_nostrEventsDao?.upsertEvent(event));
+          } on Object {
+            // Ignore sync cache errors
+          }
+        }
+
+        if (!controller.isClosed) {
+          controller.add(event);
+        }
+
+        statisticsObserver?.onEventReceived();
+      },
+      id: id,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+      relayTypes: relayTypes,
+      sendAfterAuth: sendAfterAuth,
+      onEose: onEose,
+    );
+
+    // If nostr_sdk generated a different ID, update our mapping
+    final effectiveId = (actualId != id && actualId.isNotEmpty) ? actualId : id;
+    if (effectiveId != id) {
+      _subscriptionStreams.remove(id);
+      _subscriptionStreams[effectiveId] = controller;
+      _subscriptionFilters[effectiveId] = filterHash;
+    }
+
+    statisticsObserver?.onSubscriptionStarted(effectiveId);
+
+    return controller.stream;
+  }
+
+  /// Unsubscribes from a subscription
+  Future<void> unsubscribe(String subscriptionId) async {
+    _nostr.unsubscribe(subscriptionId);
+    final controller = _subscriptionStreams.remove(subscriptionId);
+    if (controller != null && !controller.isClosed) {
+      await controller.close();
+    }
+    _subscriptionFilters.remove(subscriptionId);
+    statisticsObserver?.onSubscriptionClosed(subscriptionId);
+  }
+
+  /// Closes all subscriptions
+  ///
+  /// Properly awaits each subscription's stream controller closure to ensure
+  /// all resources are cleaned up before returning.
+  Future<void> closeAllSubscriptions() async {
+    final subscriptionIds = _subscriptionStreams.keys.toList();
+    for (final id in subscriptionIds) {
+      await unsubscribe(id);
+    }
+  }
+
+  /// Adds a relay connection
+  ///
+  /// Delegates to RelayManager for persistence and status tracking.
+  Future<bool> addRelay(String relayUrl) async {
+    return _relayManager.addRelay(relayUrl);
+  }
+
+  /// Adds multiple relay connections
+  ///
+  /// This should be called and awaited BEFORE calling initialize() to ensure
+  /// all relays are connected before the client starts making requests.
+  ///
+  /// Returns the number of relays successfully added.
+  Future<int> addRelays(List<String> relayUrls) async {
+    var addedCount = 0;
+    for (final relayUrl in relayUrls) {
+      final added = await addRelay(relayUrl);
+      if (added) {
+        addedCount++;
+      }
+    }
+    return addedCount;
+  }
+
+  /// Removes a relay connection
+  ///
+  /// Delegates to RelayManager.
+  Future<bool> removeRelay(String relayUrl) async {
+    return _relayManager.removeRelay(relayUrl);
+  }
+
+  /// Gets list of configured relay URLs
+  List<String> get configuredRelays => _relayManager.configuredRelays;
+
+  /// Gets list of connected relay URLs
+  List<String> get connectedRelays => _relayManager.connectedRelays;
+
+  /// Gets count of connected relays
+  int get connectedRelayCount => _relayManager.connectedRelayCount;
+
+  /// Gets count of configured relays
+  int get configuredRelayCount => _relayManager.configuredRelayCount;
+
+  /// Gets relay statuses
+  Map<String, RelayConnectionStatus> get relayStatuses =>
+      _relayManager.currentStatuses;
+
+  /// Stream of relay status updates
+  Stream<Map<String, RelayConnectionStatus>> get relayStatusStream =>
+      _relayManager.statusStream;
+
+  /// Primary relay for client operations
+  ///
+  /// Returns the first connected relay, or first configured relay,
+  /// or the default relay URL if none are configured.
+  String get primaryRelay {
+    if (connectedRelays.isNotEmpty) {
+      return connectedRelays.first;
+    }
+    if (configuredRelays.isNotEmpty) {
+      return configuredRelays.first;
+    }
+    return 'wss://relay.divine.video';
+  }
+
+  /// Returns per-relay counters from the SDK's [RelayStatus].
+  ///
+  /// These are the actual per-relay statistics tracked by the SDK
+  /// (events received, queries sent, errors) — not app-level aggregates.
+  Map<String, ({int eventsReceived, int queriesSent, int errors})>
+  getRelayPoolCounters() {
+    return _relayManager.getRelayPoolCounters();
+  }
+
+  /// Gets relay statistics for diagnostics
+  ///
+  /// Returns a map containing relay connection stats.
+  Future<Map<String, dynamic>?> getRelayStats() async {
+    return {
+      'connectedRelays': connectedRelayCount,
+      'configuredRelays': configuredRelayCount,
+      'relays': configuredRelays,
+    };
+  }
+
+  /// Retry connecting to all disconnected relays
+  Future<void> retryDisconnectedRelays() async {
+    await _relayManager.retryDisconnectedRelays();
+  }
+
+  /// Force reconnect all relays (disconnect first, then reconnect)
+  ///
+  /// Use this when WebSocket connections may have been silently dropped
+  /// (e.g., after app backgrounding).
+  Future<void> forceReconnectAll() async {
+    await _relayManager.forceReconnectAll();
+  }
+
+  /// Gets relay connection status as a simple map.
+  ///
+  /// Returns `Map<String, bool>` where the value indicates if
+  /// the relay is connected.
+  Map<String, bool> getRelayStatus() {
+    final statuses = relayStatuses;
+    final result = <String, bool>{};
+    for (final entry in statuses.entries) {
+      result[entry.key] =
+          entry.value.state == RelayState.connected ||
+          entry.value.state == RelayState.authenticated;
+    }
+    return result;
+  }
+
+  /// Sends a like reaction to an event
+  ///
+  /// Parameters:
+  /// - [eventId]: The event ID being liked (required)
+  /// - [content]: Reaction content, defaults to '+' for likes
+  /// - [addressableId]: Optional addressable ID for Kind 30000+ events
+  ///   (format: "kind:pubkey:d-tag"). When provided, adds an 'a' tag for
+  ///   better discoverability of likes on addressable events.
+  /// - [targetAuthorPubkey]: Optional pubkey of the liked event's author
+  /// - [targetKind]: Optional kind of the event being liked (e.g., 34236)
+  ///
+  /// Successfully sent events are cached locally with 1-day expiry.
+  Future<Event?> sendLike(
+    String eventId, {
+    String? content,
+    String? addressableId,
+    String? targetAuthorPubkey,
+    int? targetKind,
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+  }) async {
+    final likeEvent = await _nostr.sendLike(
+      eventId,
+      pubkey: targetAuthorPubkey,
+      content: content,
+      addressableId: addressableId,
+      targetKind: targetKind,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+    );
+    if (likeEvent != null) {
+      _cacheEvent(likeEvent);
+    }
+    return likeEvent;
+  }
+
+  /// Sends a user profile (Kind 0 metadata event).
+  ///
+  /// Routes through [publishEvent] to ensure relay health checks and
+  /// reconnection logic run before broadcasting. Kind 0 is replaceable,
+  /// so the event is cached only on successful publish.
+  Future<Event?> sendProfile({
+    required Map<String, dynamic> profileContent,
+  }) async {
+    final event = Event(
+      publicKey,
+      EventKind.metadata,
+      [],
+      jsonEncode(profileContent),
+    );
+    return publishEvent(event);
+  }
+
+  /// Sends a repost
+  ///
+  /// Successfully sent events are cached locally with 1-day expiry.
+  Future<Event?> sendRepost(
+    String eventId, {
+    String? relayAddr,
+    String content = '',
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+  }) async {
+    final repostEvent = await _nostr.sendRepost(
+      eventId,
+      relayAddr: relayAddr,
+      content: content,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+    );
+    if (repostEvent != null) {
+      _cacheEvent(repostEvent);
+    }
+    return repostEvent;
+  }
+
+  /// Sends a generic repost (Kind 16) for addressable events.
+  ///
+  /// Generic reposts (NIP-18) are used for reposting addressable events
+  /// like videos (Kind 34236) using the 'a' tag instead of 'e' tag.
+  ///
+  /// Parameters:
+  /// - [addressableId]: The addressable event identifier
+  ///   (e.g., "34236:pubkey:d-tag")
+  /// - [targetKind]: The kind of the event being reposted
+  ///   (e.g., 34236 for videos)
+  /// - [authorPubkey]: The public key of the original event author
+  /// - [content]: Optional content for the repost (usually empty)
+  ///
+  /// Successfully sent events are cached locally with 1-day expiry.
+  ///
+  /// Note: Including [eventId] is recommended for better relay compatibility.
+  /// Some relays don't properly index `#a` tags, but `#e` tags are universally
+  /// supported.
+  Future<Event?> sendGenericRepost({
+    required String addressableId,
+    required int targetKind,
+    required String authorPubkey,
+    String? eventId,
+    String content = '',
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+  }) async {
+    final tags = <List<String>>[
+      ['k', '$targetKind'],
+      ['a', addressableId],
+      ['p', authorPubkey],
+    ];
+
+    // Include e tag for better relay compatibility (NIP-18 recommends this)
+    if (eventId != null) {
+      tags.add(['e', eventId]);
+    }
+
+    final event = Event(
+      publicKey,
+      EventKind.genericRepost,
+      tags,
+      content,
+    );
+
+    final sentEvent = await _nostr.sendEvent(
+      event,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+    );
+
+    if (sentEvent != null) {
+      _cacheEvent(sentEvent);
+    }
+
+    return sentEvent;
+  }
+
+  /// Deletes an event
+  ///
+  /// Sends a NIP-09 deletion event (Kind 5) and removes the target event
+  /// from the local database cache.
+  Future<Event?> deleteEvent(
+    String eventId, {
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+  }) async {
+    final deletionEvent = await _nostr.deleteEvent(
+      eventId,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+    );
+    if (deletionEvent != null) {
+      // Delete target event from local database
+      _handleDeletionEvent(deletionEvent);
+    }
+    return deletionEvent;
+  }
+
+  /// Deletes multiple events
+  ///
+  /// Sends a NIP-09 deletion event (Kind 5) and removes the target events
+  /// from the local database cache.
+  Future<Event?> deleteEvents(
+    List<String> eventIds, {
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+  }) async {
+    final deletionEvent = await _nostr.deleteEvents(
+      eventIds,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+    );
+    if (deletionEvent != null) {
+      // Delete target events from local database
+      _handleDeletionEvent(deletionEvent);
+    }
+    return deletionEvent;
+  }
+
+  /// Sends a contact list
+  ///
+  /// Successfully sent events are cached locally with 1-day expiry.
+  Future<Event?> sendContactList(
+    ContactList contacts,
+    String content, {
+    List<String>? tempRelays,
+    List<String>? targetRelays,
+  }) async {
+    final contactListEvent = await _nostr.sendContactList(
+      contacts,
+      content,
+      tempRelays: tempRelays,
+      targetRelays: targetRelays,
+    );
+    if (contactListEvent != null) {
+      _cacheEvent(contactListEvent);
+    }
+    return contactListEvent;
+  }
+
+  /// Known NIP-50 compatible search relays.
+  static const List<String> _nip50SearchRelays = [
+    'wss://relay.nostr.band',
+    'wss://search.nos.today',
+    'wss://nostr.wine',
+  ];
+
+  /// Searches for video events using NIP-50 search.
+  ///
+  /// Includes known NIP-50 relays for better coverage.
+  Stream<Event> searchVideos(
+    String query, {
+    List<String>? authors,
+    DateTime? since,
+    DateTime? until,
+    int? limit,
+  }) {
+    final filter = Filter(
+      kinds: const [34236],
+      authors: authors,
+      since: since != null ? since.millisecondsSinceEpoch ~/ 1000 : null,
+      until: until != null ? until.millisecondsSinceEpoch ~/ 1000 : null,
+      limit: limit ?? 100,
+      search: query,
+    );
+
+    return subscribe([filter], tempRelays: _nip50SearchRelays);
+  }
+
+  /// Searches for user profiles using NIP-50 search.
+  ///
+  /// Includes known NIP-50 relays for better coverage.
+  Stream<Event> searchUsers(
+    String query, {
+    int? limit,
+  }) {
+    final filter = Filter(
+      kinds: const [EventKind.metadata],
+      limit: limit ?? 100,
+      search: query,
+    );
+
+    return subscribe([filter], tempRelays: _nip50SearchRelays);
+  }
+
+  /// Queries for user profiles using NIP-50 search
+  ///
+  /// Returns a list of profile events (kind 0) matching the search query.
+  /// Uses NIP-50 search parameter for full-text search on compatible relays.
+  ///
+  /// Unlike [searchUsers], this returns a Future that completes once,
+  /// making it suitable for one-time search operations.
+  Future<List<Event>> queryUsers(
+    String query, {
+    int? limit,
+  }) {
+    final filter = Filter(
+      kinds: const [EventKind.metadata],
+      limit: limit ?? 100,
+      search: query,
+    );
+
+    return queryEvents([filter], tempRelays: _nip50SearchRelays);
+  }
+
+  /// Creates a NIP-98 HTTP authentication header.
+  ///
+  /// Generates a signed kind 27235 event containing the [url] and [method],
+  /// plus an optional SHA256 hash of the [payload]. Returns the header value
+  /// in the format `Nostr <base64-encoded-event>`.
+  Future<String?> createNip98AuthHeader({
+    required String url,
+    required String method,
+    String? payload,
+  }) async {
+    final tags = [
+      ['u', url],
+      ['method', method],
+      if (payload != null)
+        ['payload', HashUtil.sha256Bytes(utf8.encode(payload))],
+    ];
+    final nip98Event = Event(_nostr.publicKey, EventKind.httpAuth, tags, '');
+    await _nostr.signEvent(nip98Event);
+
+    if (nip98Event.id.isEmpty || nip98Event.sig.isEmpty) return null;
+
+    final eventJson = jsonEncode(nip98Event.toJson());
+    final base64Event = base64Encode(utf8.encode(eventJson));
+    return 'Nostr $base64Event';
+  }
+
+  /// Disposes the client and cleans up resources
+  ///
+  /// Closes all subscriptions, disconnects from relays, and cleans up
+  /// internal state. After calling this, the client should not be used.
+  Future<void> dispose() async {
+    await closeAllSubscriptions();
+    await _relayManager.dispose();
+    _nostr.close();
+    _subscriptionFilters.clear();
+    _isDisposed = true;
+  }
+
+  /// Generates a deterministic hash for filters
+  /// to prevent duplicate subscriptions
+  String _generateFilterHash(List<Filter> filters) {
+    final json = filters.map((f) => f.toJson()).toList();
+    final jsonString = jsonEncode(json);
+    final bytes = utf8.encode(jsonString);
+    final digest = sha256.convert(bytes);
+    return digest.toString().substring(0, 16);
+  }
+
+  /// Merges cached and network events, deduplicating by event ID.
+  /// Network events take precedence (considered fresher).
+  ///
+  /// If [limit] is provided, returns at most [limit] events sorted by
+  /// `created_at` descending (most recent first). This ensures the original
+  /// filter's limit is respected even when combining multiple sources.
+  List<Event> _mergeEvents(
+    List<Event> cached,
+    List<Event> network, {
+    int? limit,
+  }) {
+    if (cached.isEmpty && network.isEmpty) return [];
+    if (cached.isEmpty) {
+      return limit != null && network.length > limit
+          ? (network..sort((a, b) => b.createdAt - a.createdAt))
+                .take(limit)
+                .toList()
+          : network;
+    }
+    if (network.isEmpty) {
+      return limit != null && cached.length > limit
+          ? (cached..sort((a, b) => b.createdAt - a.createdAt))
+                .take(limit)
+                .toList()
+          : cached;
+    }
+
+    final eventMap = <String, Event>{};
+    // Add cached events first
+    for (final event in cached) {
+      eventMap[event.id] = event;
+    }
+    // Network events overwrite cached (fresher data)
+    for (final event in network) {
+      eventMap[event.id] = event;
+    }
+
+    final merged = eventMap.values.toList();
+
+    // Apply limit if specified, returning the most recent events
+    if (limit != null && merged.length > limit) {
+      merged.sort((a, b) => b.createdAt - a.createdAt);
+      return merged.take(limit).toList();
+    }
+
+    return merged;
+  }
+}

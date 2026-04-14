@@ -1,0 +1,426 @@
+// ABOUTME: Data model for NIP-01 user profile metadata from kind 0 events.
+// ABOUTME: Represents user information like display name, avatar, bio, and
+// ABOUTME: social links.
+
+// TODO(any): Replace dynamic row with typed Drift table class to fix
+//  avoid_dynamic_calls warnings. Requires coordination with database layer.
+// ignore_for_file: avoid_dynamic_calls
+
+import 'dart:convert';
+import 'dart:math';
+
+import 'package:meta/meta.dart';
+import 'package:nostr_sdk/event.dart';
+import 'package:unique_names_generator/unique_names_generator.dart';
+
+/// Model representing a Nostr user profile from kind 0 events
+@immutable
+class UserProfile {
+  const UserProfile({
+    required this.pubkey,
+    required this.rawData,
+    required this.createdAt,
+    required this.eventId,
+    this.name,
+    this.displayName,
+    this.about,
+    this.picture,
+    this.banner,
+    this.website,
+    this.nip05,
+    this.lud16,
+    this.lud06,
+  });
+
+  /// Create UserProfile from a Nostr kind 0 event
+  factory UserProfile.fromNostrEvent(Event event) {
+    if (event.kind != 0) {
+      throw ArgumentError('Event must be kind 0 (user metadata)');
+    }
+
+    try {
+      // Parse the JSON content
+      final content = jsonDecode(event.content) as Map<String, dynamic>;
+
+      return UserProfile(
+        pubkey: event.pubkey,
+        name: content['name']?.toString(),
+        displayName:
+            content['display_name']?.toString() ??
+            content['displayName']?.toString(),
+        about: content['about']?.toString(),
+        picture: content['picture']?.toString(),
+        banner: content['banner']?.toString(),
+        website: content['website']?.toString(),
+        nip05: content['nip05']?.toString(),
+        lud16: content['lud16']?.toString(),
+        lud06: content['lud06']?.toString(),
+        rawData: content,
+        createdAt: event.createdAtDateTime,
+        eventId: event.id,
+      );
+    } on FormatException {
+      // If JSON parsing fails, create a minimal profile
+      return UserProfile(
+        pubkey: event.pubkey,
+        rawData: const {},
+        createdAt: event.createdAtDateTime,
+        eventId: event.id,
+      );
+    }
+  }
+
+  /// Create profile from JSON
+  factory UserProfile.fromJson(Map<String, dynamic> json) => UserProfile(
+    pubkey: json['pubkey'] as String,
+    name: json['name'] as String?,
+    displayName: json['display_name'] as String?,
+    about: json['about'] as String?,
+    picture: json['picture'] as String?,
+    banner: json['banner'] as String?,
+    website: json['website'] as String?,
+    nip05: json['nip05'] as String?,
+    lud16: json['lud16'] as String?,
+    lud06: json['lud06'] as String?,
+    rawData: json['raw_data'] as Map<String, dynamic>? ?? {},
+    createdAt: DateTime.fromMillisecondsSinceEpoch(
+      json['created_at'] as int,
+      isUtc: true,
+    ),
+    eventId: json['event_id'] as String,
+  );
+
+  /// Creates a [UserProfile] from a Funnelcake REST API response.
+  ///
+  /// Both single-profile and batch endpoints return the same shape, so this
+  /// factory works for either. Use [eventIdPrefix] to distinguish the source
+  /// (defaults to `'rest'`; batch callers pass `'rest-bulk'`).
+  factory UserProfile.fromFunnelcake(
+    String pubkey,
+    Map<String, dynamic> data, {
+    String? eventIdPrefix,
+  }) {
+    return UserProfile(
+      pubkey: pubkey,
+      name: data['name'] as String?,
+      displayName: data['display_name'] as String?,
+      about: data['about'] as String?,
+      picture: data['picture'] as String?,
+      banner: data['banner'] as String?,
+      website: data['website'] as String?,
+      nip05: data['nip05'] as String?,
+      lud16: data['lud16'] as String?,
+      rawData: data,
+      createdAt: DateTime.now(),
+      eventId: '${eventIdPrefix ?? 'rest'}-$pubkey',
+    );
+  }
+
+  /// Create profile from Drift database row
+  factory UserProfile.fromDrift(dynamic row) {
+    // Parse rawData from JSON string if present
+    var parsedRawData = <String, dynamic>{};
+    if (row.rawData != null && row.rawData is String) {
+      try {
+        parsedRawData =
+            jsonDecode(row.rawData as String) as Map<String, dynamic>;
+      } on FormatException {
+        // If JSON parsing fails, use empty map
+        parsedRawData = {};
+      }
+    }
+
+    return UserProfile(
+      pubkey: row.pubkey as String,
+      name: row.name as String?,
+      displayName: row.displayName as String?,
+      about: row.about as String?,
+      picture: row.picture as String?,
+      banner: row.banner as String?,
+      website: row.website as String?,
+      nip05: row.nip05 as String?,
+      lud16: row.lud16 as String?,
+      lud06: row.lud06 as String?,
+      rawData: parsedRawData,
+      createdAt: row.createdAt as DateTime,
+      eventId: row.eventId as String,
+    );
+  }
+  final String pubkey;
+  final String? name;
+  final String? displayName;
+  final String? about;
+  final String? picture;
+  final String? banner;
+  final String? website;
+  final String? nip05;
+  final String? lud16; // Lightning address
+  final String? lud06; // LNURL
+  final Map<String, dynamic> rawData;
+  final DateTime createdAt;
+  final String eventId;
+
+  /// Get shortened pubkey for display
+  String get shortPubkey {
+    if (pubkey.length <= 16) return pubkey;
+    return pubkey;
+  }
+
+  /// Like [bestDisplayName] but with a custom fallback placeholder.
+  ///
+  /// If [anonymousPlaceholder] is provided, it takes priority over the
+  /// generated name when no display name or name is set.
+  String betterDisplayName(String? anonymousPlaceholder) {
+    if (displayName?.isNotEmpty ?? false) return displayName!;
+    if (name?.isNotEmpty ?? false) return name!;
+    if (anonymousPlaceholder != null) return anonymousPlaceholder;
+    return defaultDisplayName;
+  }
+
+  /// A display handle for the user, prefixed with `@`.
+  ///
+  /// Prefers NIP-05 identifier, falls back to [name]. Returns an empty
+  /// string when neither is available.
+  String get handle {
+    if (nip05 != null && nip05!.isNotEmpty) {
+      final dn = displayNip05!;
+      return dn.startsWith('@') ? dn : '@$dn';
+    }
+    if (name != null && name!.isNotEmpty) return '@$name';
+    return '';
+  }
+
+  /// NIP-05 formatted for display.
+  ///
+  /// Normalises all divine.video / openvine.co identifiers to the canonical
+  /// `@username.divine.video` form. External identifiers (e.g.
+  /// `alice@example.com`) are returned unchanged.
+  String? get displayNip05 {
+    if (nip05 == null || nip05!.isEmpty) return null;
+    // New subdomain format: _@username.divine.video → @username.divine.video
+    if (nip05!.startsWith('_@')) return nip05!.substring(1);
+    // Legacy divine.video/openvine.co → @username.divine.video
+    final username = divineUsername;
+    if (username != null) return '@$username.divine.video';
+    // External domain: keep as-is
+    return nip05;
+  }
+
+  /// Whether the banner field contains a hex color (Vine import).
+  bool get hasProfileBackgroundColor {
+    final b = banner;
+    if (b == null || b.isEmpty) return false;
+    return b.startsWith('0x') || b.startsWith('#');
+  }
+
+  /// Whether the banner field is an image URL.
+  bool get hasBannerImage {
+    final b = banner;
+    return b != null && b.startsWith('http');
+  }
+
+  /// Get the best available display name.
+  ///
+  /// Falls back to [defaultDisplayName] when no display name or name is set.
+  String get bestDisplayName {
+    if (displayName?.isNotEmpty ?? false) return displayName!;
+    if (name?.isNotEmpty ?? false) return name!;
+    return defaultDisplayName;
+  }
+
+  /// A deterministic "Adjective Animal Number" name derived from the pubkey.
+  String get generatedName => generatedNameFor(pubkey);
+
+  /// The default display name to show when no profile name is set.
+  ///
+  /// Delegates to [defaultDisplayNameFor]. Change that single method to
+  /// switch the fallback strategy app-wide (e.g. back to truncated npubs).
+  String get defaultDisplayName => defaultDisplayNameFor(pubkey);
+
+  /// The default display name for a pubkey that has no profile name set.
+  ///
+  /// Currently returns a deterministic generated name. To switch the
+  /// fallback strategy app-wide, change only this method.
+  static String defaultDisplayNameFor(String pubkey) =>
+      generatedNameFor(pubkey);
+
+  /// Generate a deterministic "Adjective Animal Number" name for a [pubkey].
+  static String generatedNameFor(String pubkey) {
+    final seed = pubkey.codeUnits.fold<int>(0, (prev, c) => prev * 31 + c);
+    final random = Random(seed);
+    final adj = adjectives[random.nextInt(adjectives.length)];
+    final animal = animals[random.nextInt(animals.length)];
+    final number = random.nextInt(99) + 1;
+    return '${adj[0].toUpperCase()}${adj.substring(1)} '
+        '${animal[0].toUpperCase()}${animal.substring(1)} $number';
+  }
+
+  /// Follower count from either Funnelcake REST API or Nostr Kind 0 rawData.
+  ///
+  /// Checks `follower_count` (REST) and `vine_followers` (Kind 0).
+  /// Returns `null` when neither source provides a value.
+  int? get followerCount {
+    final raw = rawData['follower_count'] ?? rawData['vine_followers'];
+    if (raw == null) return null;
+    return raw is int ? raw : int.tryParse('$raw');
+  }
+
+  /// Video count from either Funnelcake REST API or Nostr Kind 0 rawData.
+  ///
+  /// Checks `video_count` (REST) and `vine_loops` (Kind 0).
+  /// Returns `null` when neither source provides a value.
+  int? get videoCount {
+    final raw = rawData['video_count'] ?? rawData['vine_loops'];
+    if (raw == null) return null;
+    return raw is int ? raw : int.tryParse('$raw');
+  }
+
+  /// Check if profile has basic information
+  bool get hasBasicInfo =>
+      (name?.isNotEmpty ?? false) ||
+      (displayName?.isNotEmpty ?? false) ||
+      (picture?.isNotEmpty ?? false);
+
+  /// Check if profile has avatar
+  bool get hasAvatar => picture?.isNotEmpty ?? false;
+
+  /// Check if profile has bio
+  bool get hasBio => about?.isNotEmpty ?? false;
+
+  /// Extracts a divine.video username from the NIP-05 identifier.
+  ///
+  /// Supports:
+  /// - New subdomain format: `_@username.divine.video`
+  /// - Legacy formats: `username@divine.video`, `username@openvine.co`
+  ///
+  /// Returns `null` if [nip05] is null, empty, or not a recognized domain.
+  String? get divineUsername {
+    if (nip05 == null || nip05!.isEmpty) return null;
+
+    // New subdomain format: _@username.divine.video
+    final subdomainMatch = RegExp(
+      r'^_@([a-z0-9\-_.]+)\.divine\.video$',
+    ).firstMatch(nip05!);
+    if (subdomainMatch != null) return subdomainMatch.group(1);
+
+    // Legacy format: username@divine.video or username@openvine.co
+    if (nip05!.endsWith('@divine.video') || nip05!.endsWith('@openvine.co')) {
+      return nip05!.split('@')[0];
+    }
+
+    return null;
+  }
+
+  /// Whether this profile has an external (non-divine.video) NIP-05 identifier.
+  ///
+  /// Returns `true` when [nip05] is set and is NOT a divine.video or
+  /// openvine.co domain (i.e., [divineUsername] returns `null`).
+  bool get hasExternalNip05 {
+    if (nip05 == null || nip05!.isEmpty) return false;
+    return divineUsername == null;
+  }
+
+  /// Returns the external NIP-05 identifier, or `null` if using divine.video.
+  ///
+  /// Use this to detect and pre-fill external NIP-05 values in the profile
+  /// editor. Returns the raw [nip05] value when [hasExternalNip05] is `true`.
+  String? get externalNip05 => hasExternalNip05 ? nip05 : null;
+
+  /// Check if profile has verified NIP-05 identifier
+  bool get hasNip05 => nip05?.isNotEmpty ?? false;
+
+  /// Check if profile has Lightning support
+  bool get hasLightning =>
+      (lud16?.isNotEmpty ?? false) || (lud06?.isNotEmpty ?? false);
+
+  /// Get Lightning address (prefers lud16 over lud06)
+  String? get lightningAddress {
+    if (lud16?.isNotEmpty ?? false) return lud16;
+    if (lud06?.isNotEmpty ?? false) return lud06;
+    return null;
+  }
+
+  /// Vine-specific metadata getters from rawData
+  String? get vineUsername => rawData['vine_username'] as String?;
+  bool get vineVerified => rawData['vine_verified'] == true;
+  int? get vineFollowers {
+    final value = rawData['vine_followers'];
+    if (value is int) return value;
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  int? get vineLoops {
+    final value = rawData['vine_loops'];
+    if (value is int) return value;
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  /// Check if this is an imported Vine user account
+  bool get isVineImport => vineUsername != null;
+
+  /// Get location data if available
+  String? get location => rawData['location'] as String?;
+
+  /// Convert profile to JSON
+  Map<String, dynamic> toJson() => {
+    'pubkey': pubkey,
+    'name': name,
+    'display_name': displayName,
+    'about': about,
+    'picture': picture,
+    'banner': banner,
+    'website': website,
+    'nip05': nip05,
+    'lud16': lud16,
+    'lud06': lud06,
+    'created_at': createdAt.millisecondsSinceEpoch,
+    'event_id': eventId,
+    'raw_data': rawData,
+  };
+
+  /// Create copy with updated fields
+  UserProfile copyWith({
+    String? name,
+    String? displayName,
+    String? about,
+    String? picture,
+    String? banner,
+    String? website,
+    String? nip05,
+    String? lud16,
+    String? lud06,
+    Map<String, dynamic>? rawData,
+  }) => UserProfile(
+    pubkey: pubkey,
+    name: name ?? this.name,
+    displayName: displayName ?? this.displayName,
+    about: about ?? this.about,
+    picture: picture ?? this.picture,
+    banner: banner ?? this.banner,
+    website: website ?? this.website,
+    nip05: nip05 ?? this.nip05,
+    lud16: lud16 ?? this.lud16,
+    lud06: lud06 ?? this.lud06,
+    rawData: rawData ?? this.rawData,
+    createdAt: createdAt,
+    eventId: eventId,
+  );
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is UserProfile &&
+        other.pubkey == pubkey &&
+        other.eventId == eventId;
+  }
+
+  @override
+  int get hashCode => Object.hash(pubkey, eventId);
+
+  @override
+  String toString() =>
+      'UserProfile(pubkey: $shortPubkey, '
+      'name: $displayName, hasAvatar: $hasAvatar)';
+}

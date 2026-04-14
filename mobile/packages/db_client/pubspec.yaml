@@ -1,0 +1,31 @@
+name: db_client
+description: A database client package for managing local data storage.
+version: 0.1.0+1
+publish_to: none
+resolution: workspace
+
+environment:
+  sdk: ^3.11.0
+  flutter: ^3.41.1
+
+dependencies:
+  collection: ^1.19.1
+  drift: ^2.29.0
+  flutter:
+    sdk: flutter
+  meta: ^1.16.0
+  models:
+    path: ../models
+  nostr_sdk:
+    path: ../nostr_sdk
+  path: ^1.9.1
+  path_provider: ^2.1.5
+
+dev_dependencies:
+  build_runner: ^2.7.1
+  drift_dev: ^2.29.0
+  flutter_test:
+    sdk: flutter
+  mocktail: ^1.0.4
+  sqlite3: ^2.7.6
+  very_good_analysis: ^10.0.0
