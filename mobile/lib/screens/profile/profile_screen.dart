@@ -31,7 +31,10 @@ class ProfileScreenState extends State<ProfileScreen>
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
-    _load();
+    // Delay initial load to give auth + relay connection time to complete.
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) _load();
+    });
   }
 
   @override
@@ -46,9 +49,12 @@ class ProfileScreenState extends State<ProfileScreen>
   Future<void> _load() async {
     final nostr = NostrService.instance;
     if (!nostr.isAuthenticated) {
+      debugPrint('[Profile] not authenticated, skipping load');
       if (mounted) setState(() => _loading = false);
       return;
     }
+
+    debugPrint('[Profile] loading observations for ${nostr.publicKey}');
 
     try {
       final events = await nostr.queryEvents([
@@ -93,6 +99,11 @@ class ProfileScreenState extends State<ProfileScreen>
 
       final lifeList = speciesMap.values.toList()
         ..sort((a, b) => a.commonName.compareTo(b.commonName));
+
+      debugPrint(
+        '[Profile] loaded ${observations.length} observations, '
+        '${lifeList.length} species',
+      );
 
       if (mounted) {
         setState(() {

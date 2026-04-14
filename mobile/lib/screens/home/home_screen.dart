@@ -2,11 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../blocs/auth/auth_cubit.dart';
 import '../../blocs/identification/identification_bloc.dart';
 import '../../blocs/recording/recording_cubit.dart';
 import '../../models/detection_with_audio.dart';
-import '../../services/social_service.dart';
 
 /// Main screen — tap to start listening for bird sounds.
 class HomeScreen extends StatefulWidget {
@@ -39,48 +37,6 @@ class _HomeScreenState extends State<HomeScreen> {
           idBloc.add(StartIdentifying(ringBuffer: recordingCubit.ringBuffer));
         }
       });
-    }
-  }
-
-  Future<void> _shareSession(List<DetectionWithAudio> sessionList) async {
-    if (sessionList.isEmpty) return;
-    if (!context.read<AuthCubit>().state.isAuthenticated) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Connect your Nostr account first.')),
-      );
-      return;
-    }
-
-    final lines = <String>['Birds heard today:\n'];
-    for (var i = 0; i < sessionList.length; i++) {
-      final dwa = sessionList[i];
-      lines.add(
-        '${i + 1}. ${dwa.species.commonName} '
-        '(${dwa.species.scientificName}) — ${dwa.confidencePercent}',
-      );
-    }
-    lines.add('\n#birding #birdwatching #nostr');
-
-    // Use the first observation's event ID if available, otherwise skip the e tag.
-    final result = await SocialService.instance.crossPostObservation(
-      observationEventId: '',
-      species: '${sessionList.length} species',
-      commonName: 'Bird Session',
-      confidence: '${sessionList.length} birds',
-      notes: lines.join('\n'),
-    );
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            result != null
-                ? 'Session shared to Nostr!'
-                : 'Failed to share session.',
-          ),
-          backgroundColor: result != null ? Colors.green : Colors.red,
-        ),
-      );
     }
   }
 
@@ -178,12 +134,6 @@ class _HomeScreenState extends State<HomeScreen> {
                                     ?.copyWith(fontWeight: FontWeight.bold),
                               ),
                               const Spacer(),
-                              TextButton.icon(
-                                onPressed: () =>
-                                    _shareSession(idState.sessionList),
-                                icon: const Icon(Icons.share, size: 18),
-                                label: const Text('Share'),
-                              ),
                               TextButton.icon(
                                 onPressed: () => context
                                     .read<IdentificationBloc>()
