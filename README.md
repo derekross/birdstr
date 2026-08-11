@@ -175,6 +175,6 @@ flutter build ios --debug     # iOS
 
 ## License
 
-App source code: MIT
+App source code: MIT — see the [LICENSE](LICENSE) file for details.
 
 BirdNET model weights: CC BY-NC-SA 4.0 (non-commercial use only). Contact the [Cornell Lab of Ornithology](https://www.birds.cornell.edu/) for commercial licensing.
